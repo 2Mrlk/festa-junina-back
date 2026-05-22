@@ -1,143 +1,177 @@
 // ============================================================
-//  festa-junina-back — server.js  (substitui o atual)
-//  Rotas: /health, /correio, /produtos, /pamonha,
-//         /agendamentos, /milho/cotacao, /milho/blocos,
-//         /milho/carteira, /milho/transacao, /pedidos
+//  festa-junina-back — server.js
+//  Compatível com a estrutura original: rotas em /api/*
+//  Vercel: vercel.json já redireciona /* → server.js
 // ============================================================
 
 const express = require('express');
-const cors    = require('cors');
-const { createClient } = require('@supabase/supabase-js');
-
 const app = express();
-app.use(cors());
+
+// ── CORS manual (sem pacote extra) ───────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json());
 
 // ── Supabase ─────────────────────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY   // chave service_role (sem RLS)
-);
+let supabase = null;
+try {
+  const { createClient } = require('@supabase/supabase-js');
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY;
+  if (url && key) {
+    supabase = createClient(url, key);
+  }
+} catch (e) {
+  console.error('Supabase init error:', e.message);
+}
 
 // ── Helpers ──────────────────────────────────────────────────
-function ok(res, data)         { res.json(data); }
-function err(res, msg, status) { res.status(status || 500).json({ error: msg }); }
+const ok  = (res, data)       => res.json(data);
+const bad = (res, msg, code)  => res.status(code || 400).json({ error: msg });
+const dbErr = (res, e)        => res.status(500).json({ error: e?.message || 'DB error' });
+
+function requireDb(res) {
+  if (!supabase) {
+    res.status(503).json({ error: 'Banco não configurado. Verifique SUPABASE_URL e SUPABASE_SERVICE_KEY no Vercel.' });
+    return false;
+  }
+  return true;
+}
 
 // ============================================================
-//  HEALTH CHECK  ←  era isso que faltava e causava o 404
+//  HEALTH  — GET /health  e  GET /api/health
 // ============================================================
-app.get('/health', async (req, res) => {
+async function handleHealth(req, res) {
+  if (!supabase) {
+    return res.status(503).json({
+      status: 'degraded',
+      error: 'SUPABASE_URL ou SUPABASE_SERVICE_KEY não configurados'
+    });
+  }
   try {
-    // Faz uma query leve só para confirmar conexão com o Supabase
     const { error } = await supabase.from('milho_cotacoes').select('id').limit(1);
     if (error) throw error;
     ok(res, { status: 'ok', db: 'connected' });
   } catch (e) {
     res.status(503).json({ status: 'degraded', error: e.message });
   }
-});
+}
+app.get('/health',     handleHealth);
+app.get('/api/health', handleHealth);
 
 // ============================================================
-//  CORREIO ELEGANTE
+//  CORREIO ELEGANTE  — /api/correio
 // ============================================================
-app.get('/correio', async (req, res) => {
+app.get('/api/correio', async (req, res) => {
+  if (!requireDb(res)) return;
   const { data, error } = await supabase
     .from('correio_elegante')
     .select('*')
     .order('criado_em', { ascending: false })
     .limit(20);
-  if (error) return err(res, error.message);
-  // Renomeia criado_em → created_at para o frontend
+  if (error) return dbErr(res, error);
   ok(res, (data || []).map(c => ({ ...c, created_at: c.criado_em })));
 });
 
-app.post('/correio', async (req, res) => {
-  const { from_name, to_name, message, theme, anonymous } = req.body;
-  if (!to_name) return err(res, 'to_name é obrigatório', 400);
+app.post('/api/correio', async (req, res) => {
+  if (!requireDb(res)) return;
+  const { from_name, to_name, message, theme, anonymous } = req.body || {};
+  if (!to_name) return bad(res, 'to_name é obrigatório');
   const { data, error } = await supabase
     .from('correio_elegante')
-    .insert({ from_name: from_name || null, to_name, message: message || null, theme: theme || 'romantic', anonymous: !!anonymous })
-    .select()
-    .single();
-  if (error) return err(res, error.message);
+    .insert({
+      from_name: from_name || null,
+      to_name,
+      message: message || null,
+      theme: theme || 'romantic',
+      anonymous: !!anonymous
+    })
+    .select().single();
+  if (error) return dbErr(res, error);
   ok(res, data);
 });
 
 // ============================================================
-//  PRODUTOS  (leitura da tabela produtos se existir)
+//  PRODUTOS  — /api/produtos
 // ============================================================
-app.get('/produtos', async (req, res) => {
+app.get('/api/produtos', async (req, res) => {
+  if (!requireDb(res)) return;
   const { data, error } = await supabase
     .from('produtos')
     .select('*')
     .order('criado_em', { ascending: false });
-  // Se tabela não existir ainda, retorna lista vazia
+  // tabela pode não existir ainda → retorna lista vazia
   if (error) return ok(res, []);
   ok(res, data || []);
 });
 
 // ============================================================
-//  PEDIDOS  (genérico — frontend usa para itens da loja)
+//  PEDIDOS  — /api/pedidos
 // ============================================================
-app.post('/pedidos', async (req, res) => {
-  // Apenas registra; ignora silenciosamente se tabela não existir
-  const { produto_id, produto_nome, preco } = req.body;
-  ok(res, { status: 'ok', produto_nome, preco });
+app.post('/api/pedidos', async (req, res) => {
+  ok(res, { status: 'ok' });
 });
 
 // ============================================================
-//  PAMONHAS
+//  PAMONHAS  — /api/pamonha
 // ============================================================
-app.post('/pamonha', async (req, res) => {
-  const { session_id, quantidade, observacao } = req.body;
-  const qty = parseInt(quantidade);
-  if (!qty || qty < 1 || qty > 500)
-    return err(res, 'quantidade deve ser entre 1 e 500', 400);
-  const { data, error } = await supabase
-    .from('pedidos_pamonha')
-    .insert({ session_id: session_id || null, quantidade: qty, observacao: observacao || null })
-    .select()
-    .single();
-  if (error) return err(res, error.message);
-  ok(res, data);
-});
-
-app.get('/pamonha', async (req, res) => {
+app.get('/api/pamonha', async (req, res) => {
+  if (!requireDb(res)) return;
   const { session_id } = req.query;
   let q = supabase.from('pedidos_pamonha').select('*').order('criado_em', { ascending: false }).limit(50);
   if (session_id) q = q.eq('session_id', session_id);
   const { data, error } = await q;
-  if (error) return err(res, error.message);
+  if (error) return dbErr(res, error);
   ok(res, data || []);
 });
 
+app.post('/api/pamonha', async (req, res) => {
+  if (!requireDb(res)) return;
+  const { session_id, quantidade, observacao } = req.body || {};
+  const qty = parseInt(quantidade);
+  if (!qty || qty < 1 || qty > 500) return bad(res, 'quantidade deve ser entre 1 e 500');
+  const { data, error } = await supabase
+    .from('pedidos_pamonha')
+    .insert({ session_id: session_id || null, quantidade: qty, observacao: observacao || null })
+    .select().single();
+  if (error) return dbErr(res, error);
+  ok(res, data);
+});
+
 // ============================================================
-//  AGENDAMENTOS
+//  AGENDAMENTOS  — /api/agendamentos
 // ============================================================
-app.get('/agendamentos', async (req, res) => {
+app.get('/api/agendamentos', async (req, res) => {
+  if (!requireDb(res)) return;
   const { data, error } = await supabase
     .from('agendamentos')
     .select('*')
     .eq('status', 'confirmado')
     .order('horario', { ascending: true });
-  if (error) return err(res, error.message);
+  if (error) return dbErr(res, error);
   ok(res, data || []);
 });
 
-app.post('/agendamentos', async (req, res) => {
-  const { session_id, nome_usuario, horario } = req.body;
-  if (!nome_usuario || !horario) return err(res, 'nome_usuario e horario são obrigatórios', 400);
+app.post('/api/agendamentos', async (req, res) => {
+  if (!requireDb(res)) return;
+  const { session_id, nome_usuario, horario } = req.body || {};
+  if (!nome_usuario || !horario) return bad(res, 'nome_usuario e horario são obrigatórios');
 
-  // Verifica se horário já está ocupado
+  // Verifica se horário já ocupado
   const { data: exist } = await supabase
     .from('agendamentos')
     .select('id')
     .eq('horario', horario)
     .eq('status', 'confirmado')
     .limit(1);
-  if (exist && exist.length > 0) return err(res, 'Horário já ocupado', 409);
+  if (exist && exist.length > 0) return bad(res, 'Horário já ocupado', 409);
 
-  // Conta posição na fila
   const { count } = await supabase
     .from('agendamentos')
     .select('*', { count: 'exact', head: true })
@@ -146,114 +180,107 @@ app.post('/agendamentos', async (req, res) => {
   const { data, error } = await supabase
     .from('agendamentos')
     .insert({ session_id: session_id || null, nome_usuario, horario, posicao_fila: (count || 0) + 1 })
-    .select()
-    .single();
-  if (error) return err(res, error.message);
+    .select().single();
+  if (error) return dbErr(res, error);
   ok(res, data);
 });
 
-app.delete('/agendamentos/:id', async (req, res) => {
+app.delete('/api/agendamentos/:id', async (req, res) => {
+  if (!requireDb(res)) return;
   const { error } = await supabase
     .from('agendamentos')
     .update({ status: 'cancelado' })
     .eq('id', req.params.id);
-  if (error) return err(res, error.message);
+  if (error) return dbErr(res, error);
   ok(res, { status: 'cancelado' });
 });
 
 // ============================================================
-//  MILHO-COIN
+//  MILHO-COIN  — /api/milho/*
 // ============================================================
-
-// Cotação atual
-app.get('/milho/cotacao', async (req, res) => {
+app.get('/api/milho/cotacao', async (req, res) => {
+  if (!requireDb(res)) return;
   const { data, error } = await supabase
     .from('milho_cotacoes')
     .select('*')
     .order('criado_em', { ascending: false })
-    .limit(1)
-    .single();
+    .limit(1).single();
   if (error) return ok(res, { preco_brl: 0.50, variacao: 0 });
   ok(res, data);
 });
 
-// Blocos da Milho-Net
-app.get('/milho/blocos', async (req, res) => {
+app.get('/api/milho/blocos', async (req, res) => {
+  if (!requireDb(res)) return;
   const { data, error } = await supabase
     .from('milho_blocos')
     .select('*')
     .order('numero', { ascending: false })
     .limit(10);
-  if (error) return err(res, error.message);
+  if (error) return dbErr(res, error);
   ok(res, data || []);
 });
 
-// Carteira por session_id (cria se não existir)
-app.get('/milho/carteira', async (req, res) => {
+app.get('/api/milho/carteira', async (req, res) => {
+  if (!requireDb(res)) return;
   const { session_id } = req.query;
-  if (!session_id) return err(res, 'session_id obrigatório', 400);
-  let { data, error } = await supabase
+  if (!session_id) return bad(res, 'session_id obrigatório');
+
+  let { data } = await supabase
     .from('milho_carteiras')
     .select('*')
     .eq('session_id', session_id)
     .single();
-  if (error || !data) {
-    // Cria carteira nova com 100 ₥
+
+  if (!data) {
     const ins = await supabase
       .from('milho_carteiras')
       .insert({ session_id, saldo: 100 })
-      .select()
-      .single();
-    if (ins.error) return err(res, ins.error.message);
+      .select().single();
+    if (ins.error) return dbErr(res, ins.error);
     data = ins.data;
   }
   ok(res, data);
 });
 
-// Registrar transação (depósito ou pagamento)
-app.post('/milho/transacao', async (req, res) => {
-  const { session_id, tipo, valor_milho, valor_brl, descricao } = req.body;
-  if (!session_id || !tipo || !valor_milho) return err(res, 'session_id, tipo e valor_milho são obrigatórios', 400);
+app.post('/api/milho/transacao', async (req, res) => {
+  if (!requireDb(res)) return;
+  const { session_id, tipo, valor_milho, valor_brl, descricao } = req.body || {};
+  if (!session_id || !tipo || !valor_milho) return bad(res, 'session_id, tipo e valor_milho são obrigatórios');
 
-  // Busca carteira
   let { data: carteira } = await supabase
     .from('milho_carteiras')
     .select('*')
     .eq('session_id', session_id)
     .single();
-  if (!carteira) return err(res, 'Carteira não encontrada', 404);
+  if (!carteira) return bad(res, 'Carteira não encontrada', 404);
 
-  // Calcula novo saldo
   let novoSaldo = Number(carteira.saldo);
   if (tipo === 'deposito' || tipo === 'bonus') {
     novoSaldo += Number(valor_milho);
   } else if (tipo === 'pagamento') {
-    if (novoSaldo < Number(valor_milho)) return err(res, 'Saldo insuficiente', 402);
+    if (novoSaldo < Number(valor_milho)) return bad(res, 'Saldo insuficiente', 402);
     novoSaldo -= Number(valor_milho);
   }
 
-  // Atualiza saldo
   const { error: updErr } = await supabase
     .from('milho_carteiras')
     .update({ saldo: novoSaldo })
     .eq('id', carteira.id);
-  if (updErr) return err(res, updErr.message);
+  if (updErr) return dbErr(res, updErr);
 
-  // Registra transação
   const { data: tx, error: txErr } = await supabase
     .from('milho_transacoes')
     .insert({ carteira_id: carteira.id, tipo, valor_milho, valor_brl: valor_brl || null, descricao: descricao || null })
-    .select()
-    .single();
-  if (txErr) return err(res, txErr.message);
+    .select().single();
+  if (txErr) return dbErr(res, txErr);
 
   ok(res, { transacao: tx, saldo: novoSaldo });
 });
 
-// Extrato de transações
-app.get('/milho/transacoes', async (req, res) => {
+app.get('/api/milho/transacoes', async (req, res) => {
+  if (!requireDb(res)) return;
   const { session_id } = req.query;
-  if (!session_id) return err(res, 'session_id obrigatório', 400);
+  if (!session_id) return bad(res, 'session_id obrigatório');
   const { data: carteira } = await supabase
     .from('milho_carteiras')
     .select('id')
@@ -266,19 +293,19 @@ app.get('/milho/transacoes', async (req, res) => {
     .eq('carteira_id', carteira.id)
     .order('criado_em', { ascending: false })
     .limit(20);
-  if (error) return err(res, error.message);
+  if (error) return dbErr(res, error);
   ok(res, data || []);
 });
 
 // ============================================================
-//  FALLBACK 404
+//  FALLBACK
 // ============================================================
 app.use((req, res) => {
   res.status(404).json({ error: `Rota ${req.method} ${req.path} não encontrada` });
 });
 
-// ── Start ────────────────────────────────────────────────────
+// ── Start (local) ─────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Arraiá Digital API rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`API rodando na porta ${PORT}`));
 
 module.exports = app;
